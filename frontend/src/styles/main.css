@@ -196,6 +196,11 @@ body::before {
   border-top: 2px dashed var(--gb-red);
 }
 
+/* 罩漆道次停在待嵌：整行用琥珀色提示，提醒工序台先别罩 */
+.gb-row-await-inlay > td {
+  background: rgba(184, 134, 11, 0.08) !important;
+}
+
 /* 器型示意区：镶嵌纹饰叠加显示 */
 .gb-vessel {
   position: relative;

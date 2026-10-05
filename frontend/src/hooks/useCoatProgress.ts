@@ -5,8 +5,10 @@
 import { useCallback, useMemo } from 'react';
 import { useBodyStore } from '@/stores/bodyStore';
 import { useCoatStore } from '@/stores/coatStore';
+import { useInlayStore } from '@/stores/inlayStore';
 import { useRoomStore } from '@/stores/roomStore';
 import { dryingHours, roomStayHours } from '@/utils/humidity';
+import { isGatedInlayType } from '@/types/inlay';
 import { ROOM_VERDICT_LABEL } from '@/types/room';
 import { COAT_STATE_LABEL } from '@/types/coat';
 import type { BodyStat } from '@/types/body';
@@ -42,6 +44,7 @@ export function useCoatProgress(): CoatProgressResult {
   const bodies = useBodyStore((state) => state.bodies);
   const coats = useCoatStore((state) => state.coats);
   const rooms = useRoomStore((state) => state.rooms);
+  const inlays = useInlayStore((state) => state.inlays);
 
   const map = useMemo<Record<string, BodyStat>>(() => {
     const result: Record<string, BodyStat> = {};
@@ -52,6 +55,7 @@ export function useCoatProgress(): CoatProgressResult {
       const bodyRooms = rooms
         .filter((room) => room.bodyId === body.id)
         .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+      const bodyInlays = inlays.filter((inlay) => inlay.bodyId === body.id);
       const done = bodyCoats.filter((coat) => coat.state === 'done').length;
       const current = bodyCoats.find((coat) => coat.state !== 'done');
       const lastRoom = bodyRooms[bodyRooms.length - 1];
@@ -73,12 +77,12 @@ export function useCoatProgress(): CoatProgressResult {
           ? `${lastRoom.date}　${lastRoom.tempC}℃ / ${lastRoom.humidityPct}%（${ROOM_VERDICT_LABEL[lastRoom.verdict]}）`
           : '暂无记录',
         polishCount: 0,
-        inlayCount: 0,
+        inlayCount: bodyInlays.filter((inlay) => isGatedInlayType(inlay.type)).length,
         dryingHours: waitHours,
       };
     });
     return result;
-  }, [bodies, coats, rooms]);
+  }, [bodies, coats, rooms, inlays]);
 
   const list = useMemo(() => bodies.map((body) => map[body.id] ?? { ...EMPTY_STAT, bodyId: body.id }), [bodies, map]);
 

@@ -10,6 +10,12 @@ import { BODY_MATERIAL_LABEL, BODY_SHAPE_LABEL } from '@/types/body';
 import { COAT_STATE_LABEL, PAINT_TYPE_LABEL } from '@/types/coat';
 import { ROOM_VERDICT_LABEL } from '@/types/room';
 import { INSPECT_VERDICT_LABEL } from '@/types/inspect';
+import {
+  INLAY_CLAIM_STATE_LABEL,
+  INLAY_PIECE_STATE_LABEL,
+  INLAY_TYPE_LABEL,
+  type Inlay,
+} from '@/types/inlay';
 import type { LacquerSnapshot } from './db';
 
 /** 触发浏览器下载 */
@@ -96,9 +102,9 @@ export function exportReworkList(
   return filename;
 }
 
-/** 工序台账 CSV（全部胎体 + 道次 + 荫房） */
+/** 工序台账 CSV（全部胎体 + 道次 + 荫房）——髹涂工序台那份留底 */
 export function exportLedgerCsv(bodies: Body[], coats: Coat[], rooms: Room[]): string {
-  const header = ['胎体编号', '材质', '器型', '尺寸(mm)', '委托/藏家', '道次', '漆种', '色名', '涂刷日期', '湿膜(μm)', '道次状态', '待复检', '荫房日期', '温度(℃)', '湿度(%)', '判定'];
+  const header = ['胎体编号', '材质', '器型', '尺寸(mm)', '委托/藏家', '道次', '漆种', '色名', '涂刷日期', '湿膜(μm)', '道次状态', '待复检', '罩漆覆盖位置', '荫房日期', '温度(℃)', '湿度(%)', '判定'];
   const lines: string[] = [header.map(csvCell).join(',')];
   bodies.forEach((body) => {
     const bodyCoats = coats.filter((item) => item.bodyId === body.id).sort((a, b) => a.seq - b.seq);
@@ -121,6 +127,7 @@ export function exportLedgerCsv(bodies: Body[], coats: Coat[], rooms: Room[]): s
           coat ? coat.thicknessUm : '',
           coat ? COAT_STATE_LABEL[coat.state] : '',
           coat ? (coat.needRecheck ? '是' : '否') : '',
+          coat ? coat.coverPositions.join('、') : '',
           room ? room.date : '',
           room ? room.tempC : '',
           room ? room.humidityPct : '',
@@ -147,4 +154,45 @@ export async function copyText(text: string): Promise<boolean> {
     return false;
   }
   return false;
+}
+
+/** 镶嵌工位台账 CSV（胎体 + 嵌片 + 归属道次）——工位自己那份留底，与工序台那份分开导出 */
+export function exportInlayLedgerCsv(bodies: Body[], inlays: Inlay[], coats: Coat[]): string {
+  const header = ['胎体编号', '器型', '类型', '图案', '位置', '嵌贴状态', '归属核对', '归属罩漆道次', '事后补记', '材料与工艺'];
+  const lines: string[] = [header.map(csvCell).join(',')];
+  const bodyCode = (id: string): string => bodies.find((body) => body.id === id)?.code ?? id;
+  const bodyShape = (id: string): string => {
+    const body = bodies.find((item) => item.id === id);
+    return body ? BODY_SHAPE_LABEL[body.shape] : '';
+  };
+  const coatText = (id: string | null): string => {
+    if (!id) return '';
+    const coat = coats.find((item) => item.id === id);
+    return coat ? `第${coat.seq}道·${PAINT_TYPE_LABEL[coat.paintType]}` : '';
+  };
+  [...inlays]
+    .sort((a, b) =>
+      a.bodyId === b.bodyId ? a.position.localeCompare(b.position) : a.bodyId.localeCompare(b.bodyId),
+    )
+    .forEach((inlay) => {
+      lines.push(
+        [
+          bodyCode(inlay.bodyId),
+          bodyShape(inlay.bodyId),
+          INLAY_TYPE_LABEL[inlay.type],
+          inlay.pattern,
+          inlay.position,
+          INLAY_PIECE_STATE_LABEL[inlay.pieceState],
+          INLAY_CLAIM_STATE_LABEL[inlay.claimState],
+          coatText(inlay.claimedCoatId),
+          inlay.lateRegistered ? '是' : '否',
+          inlay.materialNote,
+        ]
+          .map(csvCell)
+          .join(','),
+      );
+    });
+  const filename = `镶嵌工位台账-${stampSuffix()}.csv`;
+  download(filename, `﻿${lines.join('\n')}`, 'text/csv;charset=utf-8');
+  return filename;
 }

@@ -36,6 +36,7 @@ import StatBadge from '@/components/common/StatBadge';
 import { useIdbTable } from '@/hooks/useIdbTable';
 import { useBodyStore } from '@/stores/bodyStore';
 import { useCoatStore } from '@/stores/coatStore';
+import { useInlayStore } from '@/stores/inlayStore';
 import { useRoomStore } from '@/stores/roomStore';
 import { COAT_STATE_LABEL, PAINT_TYPE_LABEL } from '@/types/coat';
 import { BODY_SHAPE_LABEL } from '@/types/body';
@@ -60,7 +61,7 @@ import {
   writeLastBackupAt,
   type LacquerSnapshot,
 } from '@/utils/db';
-import { buildReworkList, copyText, exportLedgerCsv, exportReworkList, exportSnapshotJson } from '@/utils/export';
+import { buildReworkList, copyText, exportInlayLedgerCsv, exportLedgerCsv, exportReworkList, exportSnapshotJson } from '@/utils/export';
 
 export default function ExportView() {
   const { message, modal } = AntdApp.useApp();
@@ -74,6 +75,8 @@ export default function ExportView() {
   const loadCoats = useCoatStore((state) => state.loadCoats);
   const rooms = useRoomStore((state) => state.rooms);
   const loadRooms = useRoomStore((state) => state.loadRooms);
+  const inlays = useInlayStore((state) => state.inlays);
+  const loadInlays = useInlayStore((state) => state.loadInlays);
 
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<Inspect | null>(null);
@@ -176,7 +179,7 @@ export default function ExportView() {
       cancelText: '取消',
       onOk: async () => {
         await importSnapshot(parsed as LacquerSnapshot);
-        await Promise.all([loadBodies(), loadCoats(), loadRooms()]);
+        await Promise.all([loadBodies(), loadCoats(), loadInlays(), loadRooms()]);
         message.success('导入完成，数据已覆盖');
       },
     });
@@ -184,7 +187,7 @@ export default function ExportView() {
 
   const handleReset = async (): Promise<void> => {
     await resetDatabase();
-    await Promise.all([loadBodies(), loadCoats(), loadRooms()]);
+    await Promise.all([loadBodies(), loadCoats(), loadInlays(), loadRooms()]);
     message.success('已清空并重新载入演示数据');
   };
 
@@ -384,7 +387,15 @@ export default function ExportView() {
                     message.success(`已导出 ${filename}`);
                   }}
                 >
-                  工序台账 CSV
+                  工序台台账 CSV
+                </Button>
+                <Button
+                  onClick={() => {
+                    const filename = exportInlayLedgerCsv(bodies, inlays, coats);
+                    message.success(`已导出 ${filename}`);
+                  }}
+                >
+                  镶嵌工位台账 CSV
                 </Button>
               </Space>
               <Alert

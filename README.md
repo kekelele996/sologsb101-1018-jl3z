@@ -68,10 +68,10 @@ npm run preview    # 本地预览构建产物（http://localhost:22818）
 | 路由 | 页面 | 主要职责 | 消费模型 |
 | --- | --- | --- | --- |
 | `/bodies` | 胎体与器型台账 | 新建胎体、按材质与器型筛选（同步 URL query），卡片回显已完成道次与最近荫房记录 | Body、Coat、Room |
-| `/coats` | 髹涂道次编排 | 拖拽调整道次先后并重编号、批量改漆种与状态、同器型自动带出上次漆种与间隔建议 | Coat、Body |
+| `/coats` | 髹涂道次编排（工序台台账） | 拖拽调整道次先后并重编号、批量改漆种与状态、同器型自动带出上次漆种与间隔建议；罩漆道次登记**覆盖位置**，罩漆前按「胎体编号 + 位置」对工位嵌贴，没嵌完那道先停**待嵌**，对不上的挂起等补 | Coat、Body（只读 Inlay 核对） |
 | `/rooms` | 荫房温湿度记录 | 按区间判定适宜 / 偏干 / 偏湿，越界回写关联道次为「待复检」，支持日期区间筛选 | Room、Coat |
 | `/polish` | 打磨与推光工序 | 按道次生成目数序列（320→2000），未打磨完的道次禁止进入下一道罩漆 | Polish、Coat |
-| `/inlays` | 镶嵌纹饰登记 | 螺钿 / 蛋壳 / 描金 / 戗金登记与批量调整分类，器型示意区叠加显示 | Inlay、Body |
+| `/inlays` | 镶嵌工位台账 | 螺钿 / 蛋壳 / 描金 / 戗金的**纹饰登记 + 嵌片嵌贴 + 归属道次**；工位独立留底（不写 coats），已罩漆位置的事后补记单列**待认领**不退回罩漆，挂不上道次的先挂起等补 | Inlay（写）、Coat、Body（只读核对） |
 | `/export` | 成品质检与导出 | 质检登记（返工定位到具体道次与荫房记录）、返工清单、JSON 导入导出与清空重播种 | Inspect 及全部模型 |
 
 `/` 与未匹配路径重定向到 `/bodies`。筛选条件写入 URL query（`?kw=&paintType=&state=` 等），刷新后条件保留，可直接分享链接。
@@ -83,13 +83,27 @@ npm run preview    # 本地预览构建产物（http://localhost:22818）
 | 模型 | 文件 | 关键字段 | 说明 |
 | --- | --- | --- | --- |
 | Body 胎体 | `src/types/body.ts` | `id` `code` `material`（木/脱胎/金属） `shape`（碗/盘/盒/瓶） `sizeMm` `ownerName` `state`（待髹涂/髹涂中/待荫干/已完成） | 新建后进入道次编排，卡片回显进度与最近荫房 |
-| Coat 髹涂道次 | `src/types/coat.ts` | `id` `bodyId` `seq` `paintType`（生漆/色漆/罩漆） `colorName` `coatDate` `thicknessUm` `state`（待涂/已涂/待打磨/已完成） `needRecheck` | 拖拽调序，同器型带出上次漆种与间隔建议 |
+| Coat 髹涂道次 | `src/types/coat.ts` | `id` `bodyId` `seq` `paintType`（生漆/色漆/罩漆） `colorName` `coatDate` `thicknessUm` `state`（待涂/已涂/待打磨/已完成/**待嵌**） `needRecheck` `coverPositions`（罩漆覆盖位置） | 拖拽调序，同器型带出上次漆种与间隔建议；罩漆道次按覆盖位置核对工位嵌贴 |
 | Room 荫房记录 | `src/types/room.ts` | `id` `bodyId` `date` `tempC` `humidityPct` `inAt` `outAt` `verdict`（适宜/偏干/偏湿） | 越界即回写关联道次为待复检 |
 | Polish 打磨推光 | `src/types/polish.ts` | `id` `bodyId` `seq` `grit` `method`（水砂/推光/揩清） `durationMin` `operator` | 按道次生成目数序列 |
-| Inlay 镶嵌 | `src/types/inlay.ts` | `id` `bodyId` `type`（螺钿/蛋壳/描金/戗金） `pattern` `position` `materialNote` | 器型示意区叠加显示，支持批量改分类 |
+| Inlay 镶嵌（工位留底） | `src/types/inlay.ts` | `id` `bodyId` `type`（螺钿/蛋壳/描金/戗金） `pattern` `position` `materialNote` `pieceState`（待嵌/已嵌贴） `claimState`（未对道次/已归属/待认领） `claimedCoatId` `lateRegistered` `appliedAt` | 螺钿/蛋壳罩漆前必须先嵌好；工位独立留底，不写 coats |
 | Inspect 质检 | `src/types/inspect.ts` | `id` `bodyId` `verdict`（合格/返工） `defectNote` `inspector` `date` `defectCoatSeq` `defectRoomId` | 返工定位到道次与荫房记录并生成返工清单 |
 
-数据结构版本号 `DB_SCHEMA_VERSION` 定义在 `src/utils/db.ts`，当前为 `v2`：`coats` 表增加 `paintType` 索引，并在 Dexie `.upgrade()` 中为历史记录回填 `paintType = 'raw'`、`needRecheck = false`、`thicknessUm = 40`。
+数据结构版本号 `DB_SCHEMA_VERSION` 定义在 `src/utils/db.ts`，当前为 `v3`：
+v1→v2 为 `coats` 表增加 `paintType` 索引并回填 `paintType = 'raw'`、`needRecheck = false`、`thicknessUm = 40`；
+v2→v3 把镶嵌工位与髹涂工序台拆成两摊独立留底——`inlays` 补出嵌贴状态（`pieceState`/`appliedAt`）与归属道次（`claimState`/`claimedCoatId`/`lateRegistered`），`coats` 补出罩漆覆盖位置 `coverPositions`。升级时旧镶嵌记录只有图案和位置：按「胎体编号 + 位置」回填归属道次与嵌贴状态，挂不上任何罩漆道次的单列**待认领**。
+
+### 两摊分开留底（镶嵌工位 / 髹涂工序台）
+
+螺钿、蛋壳必须先嵌好再罩漆。为避免「空位被直接罩住」，两边各自留底、互不写入对方那份：
+
+- **镶嵌工位**（`/inlays`，只写 `inlays` 表）：管纹饰登记、嵌片嵌贴（待嵌/已嵌贴）、归属道次认领。
+- **髹涂工序台**（`/coats`，只写 `coats` 表）：管道次、罩漆覆盖位置与状态；罩漆前按「胎体编号 + 位置」对工位留底。
+  - 螺钿/蛋壳**没嵌完**的位置 → 这道先停在**待嵌**，工位补嵌后工序台「嵌完恢复」再罩；
+  - 工位在该位置**一条记录都没有** → 先**挂起等补**，不直接罩；
+  - 已罩过漆的位置工位事后补记 → 工位那份单列**待认领**，可认领到当时罩漆道次，**不退回、不改写**罩漆那道。
+- 核对逻辑全部在纯函数 `src/utils/reconcile.ts`；写入各自走 `src/utils/ledgerWrite.ts` 的单表事务 + 有限重试，**写入失败只退自己那份重试，另一摊不动**。
+- 两摊留底可分别导出 CSV：工序台台账（含罩漆覆盖位置）与镶嵌工位台账（含嵌贴 / 归属道次）。
 
 ---
 
@@ -100,13 +114,14 @@ sologsb101-1018/
 ├── frontend/                     # 前端源码
 │   ├── src/
 │   │   ├── types/                # body.ts coat.ts room.ts polish.ts inlay.ts inspect.ts
-│   │   ├── stores/               # bodyStore.ts coatStore.ts roomStore.ts
+│   │   ├── stores/               # bodyStore.ts coatStore.ts roomStore.ts inlayStore.ts
 │   │   ├── components/common/    # StageTag.tsx FilterBar.tsx StatBadge.tsx EmptyPanel.tsx
 │   │   ├── hooks/                # useCoatProgress.ts useIdbTable.ts
 │   │   ├── pages/                # BodyList.tsx CoatBoard.tsx RoomLog.tsx PolishBoard.tsx InlayBoard.tsx ExportView.tsx
 │   │   ├── router/               # index.tsx
-│   │   ├── utils/                # humidity.ts db.ts export.ts
+│   │   ├── utils/                # humidity.ts db.ts export.ts reconcile.ts ledgerWrite.ts
 │   │   ├── styles/               # main.css
+│   │   ├── scripts/              # verify-inlay-ledger.ts（两摊留底与 v2→v3 迁移冒烟校验）
 │   │   ├── App.tsx main.tsx
 │   ├── public/favicon.svg
 │   ├── index.html package.json tsconfig.json vite.config.ts
@@ -135,6 +150,7 @@ sologsb101-1018/
 ## 八、开发提示
 
 - 类型检查与构建：`cd frontend && npm run build`（含 `tsc --noEmit`，必须零错误）。
+- 两摊留底与 v2→v3 迁移冒烟校验：`cd frontend && npm run verify:ledger`（用 fake-indexeddb 在 Node 下跑 28 项断言，覆盖罩前核对、待嵌 / 挂起 / 待认领与旧数据补齐）。
 - 端口一致性：开发服务器（`vite.config.ts`）、预览服务、compose 的 `FRONTEND_PORT` 默认值均为 `22818`。
 - 若部署在中文路径下，`docker-compose.yml` 顶层的 `name: gblacquer` 可保证项目名不为空，`docker compose config --quiet` 不会报错。
 - 容器运行阶段执行了 `RUN chmod -R a+rX /usr/share/nginx/html`，避免宿主机静态资源权限为 0600 时 nginx worker 读取失败返回 403。

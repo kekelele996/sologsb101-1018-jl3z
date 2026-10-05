@@ -36,6 +36,7 @@ import StageTag from '@/components/common/StageTag';
 import { useCoatProgress } from '@/hooks/useCoatProgress';
 import { useBodyStore } from '@/stores/bodyStore';
 import { useCoatStore } from '@/stores/coatStore';
+import { useInlayStore } from '@/stores/inlayStore';
 import {
   COAT_STATE_LABEL,
   COAT_STATE_OPTIONS,
@@ -49,6 +50,8 @@ import {
   type PaintType,
 } from '@/types/coat';
 import { BODY_SHAPE_LABEL } from '@/types/body';
+import { INLAY_POSITION_OPTIONS, INLAY_TYPE_COLOR, INLAY_TYPE_LABEL } from '@/types/inlay';
+import { evaluateBodyTopcoats } from '@/utils/reconcile';
 import { suggestIntervalHours } from '@/utils/humidity';
 
 const FILTER_KEYS = ['paintType', 'state'] as const;
@@ -74,6 +77,11 @@ export default function CoatBoard() {
   const reorderCoats = useCoatStore((state) => state.reorderCoats);
   const nextSeq = useCoatStore((state) => state.nextSeq);
   const suggestForBody = useCoatStore((state) => state.suggestForBody);
+  const topcoatGateCheck = useCoatStore((state) => state.topcoatGateCheck);
+  const resumeFromAwaitInlay = useCoatStore((state) => state.resumeFromAwaitInlay);
+
+  // 工位那份留底只读：工序台不改 inlays，罩漆前按位置核对
+  const inlays = useInlayStore((state) => state.inlays);
 
   const { progressOf, currentCoatText, totals } = useCoatProgress();
   const url = useFilterQuery(FILTER_KEYS);
@@ -116,6 +124,19 @@ export default function CoatBoard() {
   const suggestion = bodyId.length > 0 ? suggestForBody(bodyId) : null;
   const stat = bodyId.length > 0 ? progressOf(bodyId) : null;
 
+  /** 罩漆道次的罩前核对（只读工位那份，派生逐位置结果） */
+  const gateResults = useMemo(
+    () => (bodyId ? evaluateBodyTopcoats(coats, inlays, bodyId) : []),
+    [coats, inlays, bodyId],
+  );
+  const gateByCoatId = useMemo(() => {
+    const map = new Map(gateResults.map((gate) => [gate.coat.id, gate]));
+    return map;
+  }, [gateResults]);
+  const awaitingInlays = gateResults.filter(
+    (gate) => gate.coat.state === 'awaitInlay' || gate.waitingCount > 0 || gate.unmatchedCount > 0,
+  );
+
   const openCreate = (): void => {
     if (!bodyId) {
       message.warning('请先选择或新建胎体');
@@ -140,13 +161,24 @@ export default function CoatBoard() {
       thicknessUm: coat.thicknessUm,
       state: coat.state,
       needRecheck: coat.needRecheck,
+      coverPositions: coat.coverPositions,
     });
     setOpen(true);
   };
 
+  const watchedPaintType = Form.useWatch('paintType', form) as PaintType | undefined;
+
   const submit = async (): Promise<void> => {
     const values = await form.validateFields();
-    const payload: CoatDraft = { ...values };
+    // 非罩漆道次不记录覆盖位置；罩漆道次至少留一个位置，否则罩前无从核对
+    const payload: CoatDraft = {
+      ...values,
+      coverPositions: values.paintType === 'topcoat' ? values.coverPositions ?? [] : [],
+    };
+    if (payload.paintType === 'topcoat' && payload.coverPositions.length === 0) {
+      // 不在保存时硬拦：允许先建罩漆道次，罩漆前核对时会把「无位置」挡下并提示先补
+      message.warning('该罩漆道次还没填覆盖位置，罩漆前核对会挂起，请补齐位置');
+    }
     if (editing) {
       await updateCoat(editing.id, payload);
       message.success(`已更新第 ${payload.seq} 道工序`);
@@ -178,14 +210,27 @@ export default function CoatBoard() {
     message.success('道次顺序已更新并重编号');
   };
 
-  /** 状态推进校验：前一道未完成时禁止进入下一道 */
+  /** 状态推进：前一道未完成时禁止进入下一道；罩漆道次要先过工位嵌贴核对 */
   const handleAdvance = async (coat: Coat): Promise<void> => {
     const previous = bodyCoats.find((item) => item.seq === coat.seq - 1);
     if (previous && previous.state !== 'done') {
       message.warning(`第 ${previous.seq} 道尚未完成，禁止进入第 ${coat.seq} 道`);
       return;
     }
+    if (coat.paintType === 'topcoat') {
+      const result = await topcoatGateCheck(coat.id, inlays);
+      if (result.ok) message.success(result.message);
+      else message.warning(result.message);
+      return;
+    }
     await advanceState(coat.id);
+  };
+
+  /** 待嵌道次：工位补嵌后，工序台恢复为待涂，重新核对罩漆（只动 coats 这份） */
+  const handleResume = async (coat: Coat): Promise<void> => {
+    const result = await resumeFromAwaitInlay(coat.id);
+    if (result.ok) message.success(result.message);
+    else message.error(result.message);
   };
 
   const columns: ColumnsType<Coat> = [
@@ -219,7 +264,39 @@ export default function CoatBoard() {
       ),
     },
     { title: '漆种', dataIndex: 'paintType', width: 100, render: (value: PaintType) => <Tag>{PAINT_TYPE_LABEL[value]}</Tag> },
-    { title: '色名', dataIndex: 'colorName', width: 120 },
+    {
+      title: '罩漆覆盖位置',
+      dataIndex: 'coverPositions',
+      width: 150,
+      render: (positions: string[], record) =>
+        record.paintType === 'topcoat' ? (
+          positions.length > 0 ? (
+            <Space size={2} wrap>
+              {positions.map((position) => {
+                const gate = gateByCoatId.get(record.id);
+                const hit = gate?.positions.find((item) => item.position === position);
+                const color = hit?.status === 'clear' ? 'success' : hit?.status === 'waiting' ? 'warning' : 'error';
+                return (
+                  <Tooltip key={position} title={hit?.reason ?? '罩前按位置核对工位嵌贴'}>
+                    <Tag color={color} style={{ marginInlineEnd: 0 }}>
+                      {position}
+                    </Tag>
+                  </Tooltip>
+                );
+              })}
+            </Space>
+          ) : (
+            <Typography.Text type="warning" style={{ fontSize: 12 }}>
+              未填位置，无法核对
+            </Typography.Text>
+          )
+        ) : (
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            —
+          </Typography.Text>
+        ),
+    },
+    { title: '色名', dataIndex: 'colorName', width: 110 },
     { title: '涂刷日期', dataIndex: 'coatDate', width: 130, sorter: (a, b) => a.coatDate.localeCompare(b.coatDate) },
     {
       title: '湿膜厚度',
@@ -230,11 +307,16 @@ export default function CoatBoard() {
     {
       title: '操作',
       key: 'action',
-      width: 220,
+      width: 250,
       render: (_value, record) => (
         <Space size={4} wrap>
+          {record.state === 'awaitInlay' ? (
+            <Button size="small" type="link" style={{ color: '#2f6f4f' }} onClick={() => void handleResume(record)}>
+              嵌完恢复
+            </Button>
+          ) : null}
           <Button size="small" type="link" onClick={() => void handleAdvance(record)}>
-            推进状态
+            {record.paintType === 'topcoat' ? '罩漆前核对' : '推进状态'}
           </Button>
           <Button size="small" type="link" icon={<EditOutlined />} onClick={() => openEdit(record)}>
             编辑
@@ -308,6 +390,60 @@ export default function CoatBoard() {
             </Button>
           }
         />
+      ) : null}
+
+      {gateResults.length > 0 ? (
+        <Card size="small" style={{ marginBottom: 14 }} title="罩漆前核对（按胎体编号 + 位置对工位嵌贴留底，只读不改工位那份）">
+          <Space direction="vertical" size={8} style={{ width: '100%' }}>
+            {gateResults.map((gate) => (
+              <div key={gate.coat.id} style={{ display: 'flex', gap: 8, alignItems: 'flex-start', flexWrap: 'wrap' }}>
+                <Tag color={gate.coat.state === 'awaitInlay' ? '#b8860b' : gate.canTopcoat ? 'success' : 'default'} style={{ marginTop: 2 }}>
+                  第 {gate.coat.seq} 道罩漆 · {COAT_STATE_LABEL[gate.coat.state]}
+                </Tag>
+                <Space size={4} wrap>
+                  {gate.positions.map((position) => (
+                    <Tooltip key={position.position} title={position.reason}>
+                      <Tag
+                        color={
+                          position.status === 'clear'
+                            ? 'success'
+                            : position.status === 'waiting'
+                              ? 'warning'
+                              : 'error'
+                        }
+                      >
+                        {position.position}
+                        {position.status === 'clear' ? '·可罩' : position.status === 'waiting' ? '·待嵌' : '·挂起等补'}
+                        {position.gatedInlays.length > 0 ? (
+                          <span style={{ marginLeft: 4, opacity: 0.85 }}>
+                            {position.gatedInlays.map((inlay) => (
+                              <span key={inlay.id} style={{ marginRight: 4 }}>
+                                <span style={{ color: INLAY_TYPE_COLOR[inlay.type] }}>
+                                  {INLAY_TYPE_LABEL[inlay.type]}
+                                </span>
+                                ·{inlay.pattern}
+                                {inlay.pieceState === 'applied' ? '✓' : '（未嵌）'}
+                              </span>
+                            ))}
+                          </span>
+                        ) : null}
+                      </Tag>
+                    </Tooltip>
+                  ))}
+                </Space>
+              </div>
+            ))}
+            {awaitingInlays.length === 0 ? (
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                当前胎体全部罩漆位置的螺钿 / 蛋壳均已嵌贴核对通过。
+              </Typography.Text>
+            ) : (
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                没嵌完的位置这道先停在「待嵌」；工位在镶嵌页补嵌后，点「嵌完恢复」重新核对。工位那份留底不在本页改动。
+              </Typography.Text>
+            )}
+          </Space>
+        </Card>
       ) : null}
 
       <FilterBar
@@ -396,7 +532,7 @@ export default function CoatBoard() {
               selectedRowKeys: selectedIds,
               onChange: (keys) => setSelectedIds(keys.map((key) => String(key))),
             }}
-            rowClassName={(record) => (record.id === dragId ? 'gb-row-dragging' : '')}
+            rowClassName={(record) => (record.id === dragId ? 'gb-row-dragging' : record.state === 'awaitInlay' ? 'gb-row-await-inlay' : '')}
           />
         )}
       </Card>
@@ -451,6 +587,20 @@ export default function CoatBoard() {
               ]}
             />
           </Form.Item>
+          {watchedPaintType === 'topcoat' ? (
+            <Form.Item
+              name="coverPositions"
+              label="本道罩漆覆盖位置"
+              tooltip="工序台罩漆前按「胎体编号 + 位置」对工位嵌贴留底；螺钿/蛋壳没嵌完的位置，这道先停待嵌。未填位置时罩漆核对会直接挂起。"
+            >
+              <Select
+                mode="multiple"
+                allowClear
+                placeholder="如：外壁、盖面"
+                options={INLAY_POSITION_OPTIONS.map((item) => ({ value: item, label: item }))}
+              />
+            </Form.Item>
+          ) : null}
           <Alert
             type="warning"
             showIcon

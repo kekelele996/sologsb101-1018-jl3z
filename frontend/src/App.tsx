@@ -17,6 +17,7 @@ import {
 import { ROUTES } from './router';
 import { useBodyStore } from './stores/bodyStore';
 import { useCoatStore } from './stores/coatStore';
+import { useInlayStore } from './stores/inlayStore';
 import { useRoomStore } from './stores/roomStore';
 import { initDatabase } from './utils/db';
 import { BODY_MATERIAL_LABEL, BODY_SHAPE_LABEL, BODY_STATE_LABEL } from './types/body';
@@ -33,6 +34,8 @@ export default function App() {
   const loadBodies = useBodyStore((state) => state.loadBodies);
   const coats = useCoatStore((state) => state.coats);
   const loadCoats = useCoatStore((state) => state.loadCoats);
+  const inlays = useInlayStore((state) => state.inlays);
+  const loadInlays = useInlayStore((state) => state.loadInlays);
   const rooms = useRoomStore((state) => state.rooms);
   const loadRooms = useRoomStore((state) => state.loadRooms);
 
@@ -42,7 +45,7 @@ export default function App() {
       try {
         await initDatabase();
         if (cancelled) return;
-        await Promise.all([loadBodies(), loadCoats(), loadRooms()]);
+        await Promise.all([loadBodies(), loadCoats(), loadInlays(), loadRooms()]);
       } catch (error) {
         if (cancelled) return;
         message.error(`本地数据库初始化失败：${error instanceof Error ? error.message : '未知错误'}`);
@@ -51,7 +54,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [loadBodies, loadCoats, loadRooms, message]);
+  }, [loadBodies, loadCoats, loadInlays, loadRooms, message]);
 
   const currentBody = bodies.find((body) => body.id === currentBodyId) ?? null;
   const selectedKey = location.pathname.startsWith('/coats')
@@ -98,6 +101,7 @@ export default function App() {
               <DashboardOutlined /> 胎体 {bodies.length} 件
             </span>
             <span>髹涂道次 {coats.length} 道</span>
+            <span>镶嵌登记 {inlays.length} 条</span>
             <span>荫房记录 {rooms.length} 条</span>
           </Space>
         </div>

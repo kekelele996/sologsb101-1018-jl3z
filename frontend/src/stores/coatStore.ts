@@ -1,12 +1,17 @@
 /**
- * 髹涂道次状态管理（Zustand）
- * 维护道次顺序与状态推进，支持拖拽重排落库重编号、批量改漆种与状态。
+ * 髹涂道次状态管理（Zustand）——工序台自己那份留底（coats）。
+ * 维护道次顺序与状态推进，支持拖拽重排落库重编号、批量改漆种与状态；
+ * 罩漆前按「胎体编号 + 位置」核对工位嵌贴，没嵌完那道先停在待嵌。
+ * 所有写入只动 coats 表，不改镶嵌工位的 inlays。
  */
 import { create } from 'zustand';
 import { db, createId } from '@/utils/db';
+import { writeOwnLedger } from '@/utils/ledgerWrite';
 import type { Coat, CoatDraft, CoatState, PaintType } from '@/types/coat';
 import { nextCoatState } from '@/types/coat';
 import { suggestIntervalHours, suggestPaintType } from '@/utils/humidity';
+import { evaluateTopcoatGate } from '@/utils/reconcile';
+import type { Inlay } from '@/types/inlay';
 import { useBodyStore } from './bodyStore';
 
 export interface PaintSuggestion {
@@ -14,6 +19,14 @@ export interface PaintSuggestion {
   intervalHours: number;
   sourceCode: string;
   sourceColor: string;
+}
+
+export interface GateMutationResult {
+  ok: boolean;
+  message: string;
+  /** 罩前核对明细，供页面逐位置展示 */
+  waitingPositions?: string[];
+  unmatchedPositions?: string[];
 }
 
 interface CoatStoreState {
@@ -33,6 +46,14 @@ interface CoatStoreState {
   nextSeq: (bodyId: string) => number;
   /** 同器型自动带出上次漆种与间隔建议 */
   suggestForBody: (bodyId: string) => PaintSuggestion;
+  /**
+   * 罩漆前核对：按道次覆盖位置对工位嵌贴留底。
+   * 没嵌完 → 这道停在待嵌（只写 coats）；对不上的位置挂起等补，同样不罩。
+   * 全部对得上且嵌完 → 正常推进一道。
+   */
+  topcoatGateCheck: (id: string, inlays: Inlay[]) => Promise<GateMutationResult>;
+  /** 待嵌道次恢复：工位嵌完后，工序台把道次从待嵌恢复为待涂，重新走罩前核对 */
+  resumeFromAwaitInlay: (id: string) => Promise<GateMutationResult>;
 }
 
 export const useCoatStore = create<CoatStoreState>((set, get) => ({
@@ -128,6 +149,65 @@ export const useCoatStore = create<CoatStoreState>((set, get) => ({
   nextSeq(bodyId) {
     const list = get().coats.filter((coat) => coat.bodyId === bodyId);
     return list.length === 0 ? 1 : Math.max(...list.map((coat) => coat.seq)) + 1;
+  },
+
+  async topcoatGateCheck(id, inlays) {
+    const coat = get().coats.find((item) => item.id === id);
+    if (!coat) return { ok: false, message: '道次不存在' };
+    if (coat.paintType !== 'topcoat') {
+      // 非罩漆道次不走嵌片闸口，直接线性推进
+      await get().advanceState(id);
+      return { ok: true, message: '已推进状态' };
+    }
+
+    const gate = evaluateTopcoatGate(coat, inlays);
+    if (!gate.canTopcoat) {
+      // 没嵌完 / 对不上：这道先停在待嵌（只写工序台自己那份）
+      if (coat.state !== 'awaitInlay') {
+        const result = await writeOwnLedger(
+          db.coats,
+          (table) => table.update(id, { state: 'awaitInlay', updatedAt: Date.now() }),
+          { ledgerName: '髹涂工序台台账' },
+        );
+        if (!result.ok) return { ok: false, message: result.error ?? '状态更新失败' };
+        await get().loadCoats();
+      }
+      const waiting = gate.positions.filter((item) => item.status === 'waiting').map((item) => item.position);
+      const unmatched = gate.positions.filter((item) => item.status === 'unmatched').map((item) => item.position);
+      const missingPosition = coat.coverPositions.length === 0 ? '该罩漆道次还没填覆盖位置，先补位置再核对；' : '';
+      return {
+        ok: false,
+        message:
+          missingPosition +
+          (waiting.length > 0 ? `位置 ${waiting.join('、')} 嵌片未完成，该道先停在待嵌；` : '') +
+          (unmatched.length > 0 ? `位置 ${unmatched.join('、')} 对不上工位留底，先挂起等补。` : ''),
+        waitingPositions: waiting,
+        unmatchedPositions: unmatched,
+      };
+    }
+
+    // 全部对得上且嵌完：正常罩漆推进（待嵌恢复出来的从待涂推进到已涂）
+    const baseState: CoatState = coat.state === 'awaitInlay' ? 'todo' : coat.state;
+    const next = nextCoatState(baseState);
+    const result = await writeOwnLedger(
+      db.coats,
+      (table) => table.update(id, { state: next, updatedAt: Date.now() }),
+      { ledgerName: '髹涂工序台台账' },
+    );
+    if (!result.ok) return { ok: false, message: result.error ?? '状态更新失败' };
+    await get().loadCoats();
+    return { ok: true, message: '工位嵌贴已逐位核对通过，已罩漆并推进状态' };
+  },
+
+  async resumeFromAwaitInlay(id) {
+    const result = await writeOwnLedger(
+      db.coats,
+      (table) => table.update(id, { state: 'todo', updatedAt: Date.now() }),
+      { ledgerName: '髹涂工序台台账' },
+    );
+    if (!result.ok) return { ok: false, message: result.error ?? '恢复失败' };
+    await get().loadCoats();
+    return { ok: true, message: '已恢复为待涂，请重新按位置核对后罩漆' };
   },
 
   suggestForBody(bodyId) {
