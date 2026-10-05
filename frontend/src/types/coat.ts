@@ -6,8 +6,8 @@
 /** 漆种：生漆 / 色漆 / 罩漆 */
 export type PaintType = 'raw' | 'color' | 'topcoat';
 
-/** 道次状态：待涂 / 已涂 / 待打磨 / 已完成 */
-export type CoatState = 'todo' | 'coated' | 'toPolish' | 'done';
+/** 道次状态：待涂 / 已涂 / 待打磨 / 已完成；待嵌为罩漆前的卡位（未嵌完先停在此） */
+export type CoatState = 'todo' | 'coated' | 'awaitInlay' | 'toPolish' | 'done';
 
 export interface Coat {
   id: string;
@@ -27,6 +27,11 @@ export interface Coat {
   state: CoatState;
   /** 荫房判定异常时回写的「待复检」标记 */
   needRecheck: boolean;
+  /**
+   * 罩漆覆盖位置（工序台留底）：罩漆前按 胎体编号 + 位置 与工位嵌贴核对；
+   * 仅罩漆道次登记，非罩漆道次为空数组。
+   */
+  coverPositions: string[];
   createdAt: number;
   updatedAt: number;
 }
@@ -42,6 +47,7 @@ export const PAINT_TYPE_LABEL: Record<PaintType, string> = {
 export const COAT_STATE_LABEL: Record<CoatState, string> = {
   todo: '待涂',
   coated: '已涂',
+  awaitInlay: '待嵌',
   toPolish: '待打磨',
   done: '已完成',
 };
@@ -49,11 +55,13 @@ export const COAT_STATE_LABEL: Record<CoatState, string> = {
 export const COAT_STATE_COLOR: Record<CoatState, string> = {
   todo: '#8c8c8c',
   coated: '#c9963c',
+  awaitInlay: '#b5651d',
   toPolish: '#8c2f1f',
   done: '#2f6f4f',
 };
 
-export const COAT_STATE_FLOW: readonly CoatState[] = ['todo', 'coated', 'toPolish', 'done'];
+/** 状态推进链路：待涂 → 已涂 →（罩漆前核对工位嵌贴）待嵌 → 待打磨 → 已完成 */
+export const COAT_STATE_FLOW: readonly CoatState[] = ['todo', 'coated', 'awaitInlay', 'toPolish', 'done'];
 
 export const PAINT_TYPE_OPTIONS: ReadonlyArray<{ value: PaintType; label: string }> = [
   { value: 'raw', label: '生漆' },
@@ -76,9 +84,11 @@ export const COLOR_NAME_OPTIONS: readonly string[] = [
 ];
 
 export function nextCoatState(state: CoatState): CoatState {
-  const index = COAT_STATE_FLOW.indexOf(state);
-  if (index < 0 || index >= COAT_STATE_FLOW.length - 1) return state;
-  return COAT_STATE_FLOW[index + 1] as CoatState;
+  // 通用线性推进跳过「待嵌」：该卡位只由罩漆前的工位核对显式进入/解除
+  const linear: CoatState[] = ['todo', 'coated', 'toPolish', 'done'];
+  const index = linear.indexOf(state);
+  if (index < 0 || index >= linear.length - 1) return state;
+  return linear[index + 1] as CoatState;
 }
 
 export function createEmptyCoatDraft(bodyId: string, seq: number): CoatDraft {
@@ -91,5 +101,6 @@ export function createEmptyCoatDraft(bodyId: string, seq: number): CoatDraft {
     thicknessUm: 40,
     state: 'todo',
     needRecheck: false,
+    coverPositions: [],
   };
 }

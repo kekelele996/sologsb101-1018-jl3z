@@ -12,12 +12,16 @@ import type { Room } from '@/types/room';
 import type { Polish } from '@/types/polish';
 import type { Inlay } from '@/types/inlay';
 import type { Inspect } from '@/types/inspect';
+import { coatCoversPosition } from '@/utils/inlayGate';
 
 /** 数据库名（README 与导出文件均使用该名称） */
 export const DB_NAME = 'gblacquer';
 
-/** 当前数据结构版本号 */
-export const DB_SCHEMA_VERSION = 2;
+/**
+ * 当前数据结构版本号
+ * v3：镶嵌与罩漆两摊分开留底 —— Inlay 补嵌贴/归属道次/认领，Coat 加罩漆位置与「待嵌」卡位
+ */
+export const DB_SCHEMA_VERSION = 3;
 
 /** localStorage 侧少量元数据键 */
 export const LS_KEYS = {
@@ -99,7 +103,7 @@ class LacquerDatabase extends Dexie {
     });
 
     // v2：Coat 增加 paintType 索引；历史记录缺少 paintType 时按「生漆」回填
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         bodies: 'id, code, material, shape, state, updatedAt',
         coats: 'id, bodyId, seq, paintType, state, needRecheck, updatedAt',
@@ -117,6 +121,63 @@ class LacquerDatabase extends Dexie {
             if (!legal.includes(coat.paintType)) coat.paintType = 'raw';
             if (typeof coat.needRecheck !== 'boolean') coat.needRecheck = false;
             if (typeof coat.thicknessUm !== 'number') coat.thicknessUm = 40;
+          });
+      });
+
+    // v3：镶嵌工位 / 髹涂工序台两摊分开留底
+    //  - coats 加 coverPositions 多值索引（罩漆位置，工序台留底）
+    //  - inlays 加 affixState / affixSeq / claimState 索引（嵌贴、归属道次、认领）
+    // 旧镶嵌记录只有图案和位置：补出嵌贴与归属道次，挂不上的单列「待认领」
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        bodies: 'id, code, material, shape, state, updatedAt',
+        coats: 'id, bodyId, seq, paintType, state, needRecheck, coverPositions, updatedAt',
+        rooms: 'id, bodyId, date, verdict, updatedAt',
+        polishes: 'id, bodyId, seq, method, updatedAt',
+        inlays: 'id, bodyId, type, position, affixState, affixSeq, claimState, updatedAt',
+        inspects: 'id, bodyId, verdict, date, updatedAt',
+      })
+      .upgrade(async (tx) => {
+        // 工序台那份：补罩漆位置留底（历史道次无登记，按空位置留底）
+        await tx
+          .table<Coat>('coats')
+          .toCollection()
+          .modify((coat) => {
+            if (!Array.isArray(coat.coverPositions)) coat.coverPositions = [];
+            // 历史上不存在「待嵌」卡位，异常值回落到「待涂」由工序台重新核对
+            if (coat.state === 'awaitInlay') coat.state = 'coated';
+          });
+
+        // 工位那份：只有图案和位置 → 补嵌贴状态、归属道次；挂不上的待认领
+        const coats = await tx.table<Coat>('coats').toArray();
+        const legalAffix = ['pending', 'affixed'];
+        const legalClaim = ['normal', 'unclaimed'];
+        await tx
+          .table<Inlay>('inlays')
+          .toCollection()
+          .modify((inlay) => {
+            const topcoats = coats
+              .filter((coat) => coat.bodyId === inlay.bodyId && coat.paintType === 'topcoat')
+              .sort((a, b) => a.seq - b.seq);
+            // 旧道次没有罩漆位置留底时，用「首道罩漆」兜底归属，保证旧镶嵌能补出归属道次
+            const cover =
+              topcoats.find((coat) => coatCoversPosition(coat, inlay.position)) ??
+              (topcoats.every((coat) => coat.coverPositions.length === 0) ? topcoats[0] : undefined);
+            const alreadyCoated = cover !== undefined && cover.state === 'done';
+            if (typeof inlay.affixState !== 'string' || !legalAffix.includes(inlay.affixState)) {
+              // 旧记录只有图案和位置：一律视为嵌片已嵌贴（纹饰登记即已完成嵌贴）
+              inlay.affixState = 'affixed';
+              inlay.affixedAt = typeof inlay.affixedAt === 'number' ? inlay.affixedAt : inlay.updatedAt ?? null;
+            }
+            if (inlay.affixState === 'affixed' && typeof inlay.affixedAt !== 'number') {
+              inlay.affixedAt = inlay.updatedAt ?? null;
+            }
+            // 归属道次：能对上覆盖该位置的第一道罩漆道次就补 seq
+            inlay.affixSeq = cover ? cover.seq : null;
+            // 挂不上的（无罩漆道次，或该位置已罩过漆才补记）单列待认领
+            if (typeof inlay.claimState !== 'string' || !legalClaim.includes(inlay.claimState)) {
+              inlay.claimState = cover === undefined || alreadyCoated ? 'unclaimed' : 'normal';
+            }
           });
       });
   }
@@ -184,14 +245,15 @@ export async function seedDatabase(): Promise<void> {
   ];
 
   const coats: Coat[] = [
-    { id: 'coat_0101', bodyId: 'body_01', seq: 1, paintType: 'raw', colorName: '漆黑', coatDate: '2026-03-02', thicknessUm: 40, state: 'done', needRecheck: false, createdAt: now - 86400000 * 11, updatedAt: now - 86400000 * 10 },
-    { id: 'coat_0102', bodyId: 'body_01', seq: 2, paintType: 'color', colorName: '朱红', coatDate: '2026-03-06', thicknessUm: 45, state: 'toPolish', needRecheck: true, createdAt: now - 86400000 * 7, updatedAt: now - 86400000 * 2 },
-    { id: 'coat_0103', bodyId: 'body_01', seq: 3, paintType: 'topcoat', colorName: '推光本色', coatDate: '2026-03-12', thicknessUm: 30, state: 'todo', needRecheck: false, createdAt: now - 86400000 * 6, updatedAt: now - 86400000 * 6 },
-    { id: 'coat_0201', bodyId: 'body_02', seq: 1, paintType: 'raw', colorName: '漆黑', coatDate: '2026-03-03', thicknessUm: 35, state: 'done', needRecheck: false, createdAt: now - 86400000 * 8, updatedAt: now - 86400000 * 7 },
-    { id: 'coat_0202', bodyId: 'body_02', seq: 2, paintType: 'color', colorName: '赭石', coatDate: '2026-03-08', thicknessUm: 42, state: 'coated', needRecheck: true, createdAt: now - 86400000 * 5, updatedAt: now - 86400000 },
-    { id: 'coat_0301', bodyId: 'body_03', seq: 1, paintType: 'raw', colorName: '漆黑', coatDate: '2026-02-10', thicknessUm: 38, state: 'done', needRecheck: false, createdAt: now - 86400000 * 26, updatedAt: now - 86400000 * 25 },
-    { id: 'coat_0302', bodyId: 'body_03', seq: 2, paintType: 'color', colorName: '石绿', coatDate: '2026-02-18', thicknessUm: 44, state: 'done', needRecheck: false, createdAt: now - 86400000 * 20, updatedAt: now - 86400000 * 18 },
-    { id: 'coat_0303', bodyId: 'body_03', seq: 3, paintType: 'topcoat', colorName: '描金', coatDate: '2026-02-26', thicknessUm: 28, state: 'done', needRecheck: false, createdAt: now - 86400000 * 14, updatedAt: now - 86400000 * 4 },
+    { id: 'coat_0101', bodyId: 'body_01', seq: 1, paintType: 'raw', colorName: '漆黑', coatDate: '2026-03-02', thicknessUm: 40, state: 'done', needRecheck: false, coverPositions: [], createdAt: now - 86400000 * 11, updatedAt: now - 86400000 * 10 },
+    { id: 'coat_0102', bodyId: 'body_01', seq: 2, paintType: 'color', colorName: '朱红', coatDate: '2026-03-06', thicknessUm: 45, state: 'toPolish', needRecheck: true, coverPositions: [], createdAt: now - 86400000 * 7, updatedAt: now - 86400000 * 2 },
+    { id: 'coat_0103', bodyId: 'body_01', seq: 3, paintType: 'topcoat', colorName: '推光本色', coatDate: '2026-03-12', thicknessUm: 30, state: 'todo', needRecheck: false, coverPositions: ['外壁', '口沿'], createdAt: now - 86400000 * 6, updatedAt: now - 86400000 * 6 },
+    { id: 'coat_0201', bodyId: 'body_02', seq: 1, paintType: 'raw', colorName: '漆黑', coatDate: '2026-03-03', thicknessUm: 35, state: 'done', needRecheck: false, coverPositions: [], createdAt: now - 86400000 * 8, updatedAt: now - 86400000 * 7 },
+    { id: 'coat_0202', bodyId: 'body_02', seq: 2, paintType: 'color', colorName: '赭石', coatDate: '2026-03-08', thicknessUm: 42, state: 'coated', needRecheck: true, coverPositions: [], createdAt: now - 86400000 * 5, updatedAt: now - 86400000 },
+    { id: 'coat_0203', bodyId: 'body_02', seq: 3, paintType: 'topcoat', colorName: '推光本色', coatDate: '2026-03-13', thicknessUm: 30, state: 'coated', needRecheck: false, coverPositions: ['盖面'], createdAt: now - 86400000 * 2, updatedAt: now - 86400000 },
+    { id: 'coat_0301', bodyId: 'body_03', seq: 1, paintType: 'raw', colorName: '漆黑', coatDate: '2026-02-10', thicknessUm: 38, state: 'done', needRecheck: false, coverPositions: [], createdAt: now - 86400000 * 26, updatedAt: now - 86400000 * 25 },
+    { id: 'coat_0302', bodyId: 'body_03', seq: 2, paintType: 'color', colorName: '石绿', coatDate: '2026-02-18', thicknessUm: 44, state: 'done', needRecheck: false, coverPositions: [], createdAt: now - 86400000 * 20, updatedAt: now - 86400000 * 18 },
+    { id: 'coat_0303', bodyId: 'body_03', seq: 3, paintType: 'topcoat', colorName: '描金', coatDate: '2026-02-26', thicknessUm: 28, state: 'done', needRecheck: false, coverPositions: ['通体', '外壁'], createdAt: now - 86400000 * 14, updatedAt: now - 86400000 * 4 },
   ];
 
   const rooms: Room[] = [
@@ -209,10 +271,15 @@ export async function seedDatabase(): Promise<void> {
   ];
 
   const inlays: Inlay[] = [
-    { id: 'inlay_0101', bodyId: 'body_01', type: 'nacre', pattern: '缠枝莲', position: '外壁', materialNote: '0.8mm 螺钿片，刻纹嵌贴', createdAt: now - 86400000 * 7, updatedAt: now - 86400000 * 7 },
-    { id: 'inlay_0201', bodyId: 'body_02', type: 'eggshell', pattern: '云纹', position: '盖面', materialNote: '鸭蛋壳拼贴后髹漆磨显', createdAt: now - 86400000 * 4, updatedAt: now - 86400000 * 4 },
-    { id: 'inlay_0301', bodyId: 'body_03', type: 'incisedGold', pattern: '折枝花', position: '通体', materialNote: '戗金，金粉入刻线', createdAt: now - 86400000 * 12, updatedAt: now - 86400000 * 12 },
-    { id: 'inlay_0302', bodyId: 'body_03', type: 'goldTrace', pattern: '诗文', position: '外壁', materialNote: '描金，泥金细描', createdAt: now - 86400000 * 11, updatedAt: now - 86400000 * 11 },
+    // body_01 罩漆（coat_0103 罩外壁/口沿）：外壁螺钿已嵌可过核对；口沿工位未登记 → 挂起
+    { id: 'inlay_0101', bodyId: 'body_01', type: 'nacre', pattern: '缠枝莲', position: '外壁', materialNote: '0.8mm 螺钿片，刻纹嵌贴', affixState: 'affixed', affixSeq: 3, claimState: 'normal', affixedAt: now - 86400000 * 7, createdAt: now - 86400000 * 7, updatedAt: now - 86400000 * 7 },
+    // body_02 罩漆（coat_0203 罩盖面）：盖面蛋壳只登记未嵌片 → 核对时该道停在待嵌
+    { id: 'inlay_0201', bodyId: 'body_02', type: 'eggshell', pattern: '云纹', position: '盖面', materialNote: '鸭蛋壳拼贴后髹漆磨显', affixState: 'pending', affixSeq: 3, claimState: 'normal', affixedAt: null, createdAt: now - 86400000 * 4, updatedAt: now - 86400000 * 4 },
+    // body_03 已完工通体罩漆：戗金已罩后补记，归属道次 3；描金已罩后补记但归属挂不上 → 待认领
+    { id: 'inlay_0301', bodyId: 'body_03', type: 'incisedGold', pattern: '折枝花', position: '通体', materialNote: '戗金，金粉入刻线', affixState: 'affixed', affixSeq: 3, claimState: 'normal', affixedAt: now - 86400000 * 12, createdAt: now - 86400000 * 12, updatedAt: now - 86400000 * 12 },
+    { id: 'inlay_0302', bodyId: 'body_03', type: 'goldTrace', pattern: '诗文', position: '外壁', materialNote: '描金，泥金细描', affixState: 'affixed', affixSeq: 3, claimState: 'normal', affixedAt: now - 86400000 * 11, createdAt: now - 86400000 * 11, updatedAt: now - 86400000 * 11 },
+    // 已罩漆后工位才补记底足：罩漆位置没覆盖到底足，归属挂不上 → 工位单列待认领，不退回罩漆
+    { id: 'inlay_0303', bodyId: 'body_03', type: 'nacre', pattern: '几何回纹', position: '底足', materialNote: '罩漆后补登，待工位认领归属道次', affixState: 'affixed', affixSeq: null, claimState: 'unclaimed', affixedAt: now - 86400000 * 2, createdAt: now - 86400000 * 2, updatedAt: now - 86400000 * 2 },
   ];
 
   const inspects: Inspect[] = [
@@ -279,15 +346,63 @@ export function validateSnapshot(input: unknown): string {
 }
 
 export async function importSnapshot(snapshot: LacquerSnapshot): Promise<void> {
+  const normalized = normalizeSnapshot(snapshot);
   await clearAllTables();
   await db.transaction('rw', TABLE_LIST, async () => {
-    await db.bodies.bulkPut(snapshot.bodies);
-    await db.coats.bulkPut(snapshot.coats);
-    await db.rooms.bulkPut(snapshot.rooms);
-    await db.polishes.bulkPut(snapshot.polishes);
-    await db.inlays.bulkPut(snapshot.inlays);
-    await db.inspects.bulkPut(snapshot.inspects);
+    await db.bodies.bulkPut(normalized.bodies);
+    await db.coats.bulkPut(normalized.coats);
+    await db.rooms.bulkPut(normalized.rooms);
+    await db.polishes.bulkPut(normalized.polishes);
+    await db.inlays.bulkPut(normalized.inlays);
+    await db.inspects.bulkPut(normalized.inspects);
   });
+}
+
+/**
+ * 归一化导入的备份：旧结构版本（如 v2）缺少 v3 两摊留底字段时补齐。
+ * 镶嵌旧记录只有图案和位置：补出嵌贴与归属道次，挂不上的单列待认领。
+ * 导入走整库覆盖，与 Dexie .upgrade() 同口径，不写对方那份之外的内容。
+ */
+export function normalizeSnapshot(snapshot: LacquerSnapshot): LacquerSnapshot {
+  const coats: Coat[] = snapshot.coats.map((coat) => ({
+    ...coat,
+    coverPositions: Array.isArray(coat.coverPositions)
+      ? coat.coverPositions.filter((item): item is string => typeof item === 'string')
+      : [],
+    state: coat.state === 'awaitInlay' ? 'coated' : coat.state,
+  }));
+  const inlays: Inlay[] = snapshot.inlays.map((inlay) => {
+    const hasAffix = inlay.affixState === 'pending' || inlay.affixState === 'affixed';
+    const topcoats = coats
+      .filter((coat) => coat.bodyId === inlay.bodyId && coat.paintType === 'topcoat')
+      .sort((a, b) => a.seq - b.seq);
+    // 旧备份罩漆道次可能没有位置留底：用首道罩漆兜底归属
+    const cover =
+      topcoats.find((coat) => coatCoversPosition(coat, inlay.position)) ??
+      (topcoats.length > 0 && topcoats.every((coat) => coat.coverPositions.length === 0)
+        ? topcoats[0]
+        : undefined);
+    const alreadyCoated = cover !== undefined && cover.state === 'done';
+    const affixState = hasAffix ? inlay.affixState : 'affixed';
+    return {
+      ...inlay,
+      affixState,
+      affixedAt:
+        typeof inlay.affixedAt === 'number'
+          ? inlay.affixedAt
+          : affixState === 'affixed'
+            ? (inlay.updatedAt ?? null)
+            : null,
+      affixSeq: typeof inlay.affixSeq === 'number' ? inlay.affixSeq : cover ? cover.seq : null,
+      claimState:
+        inlay.claimState === 'normal' || inlay.claimState === 'unclaimed'
+          ? inlay.claimState
+          : cover === undefined || alreadyCoated
+            ? 'unclaimed'
+            : 'normal',
+    } as Inlay;
+  });
+  return { ...snapshot, coats, inlays };
 }
 
 export async function clearAllTables(): Promise<void> {

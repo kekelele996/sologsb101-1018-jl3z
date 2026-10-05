@@ -2,7 +2,13 @@
 
 面向漆艺工作室工序管理员的本地化档案工具：把每件漆器的髹涂道次、荫干时长与打磨推光逐道记录，并同步留存荫房温湿度，作为漆层缺陷回溯依据。
 
-核心动作：**登记胎体与器型 → 编排髹涂道次与漆种 → 记录荫房温湿度 → 登记打磨与推光 → 登记镶嵌纹饰 → 成品质检与导出**。
+核心动作：**登记胎体与器型 → 编排髹涂道次与漆种 → 记录荫房温湿度 → 登记打磨与推光 → 登记镶嵌纹饰与嵌贴 → 罩漆前按位置核对工位嵌贴 → 成品质检与导出**。
+
+**两摊分开留底（镶嵌 / 罩漆协同）**：螺钿蛋壳须先嵌好再罩漆。镶嵌工位（`/inlays`）只记自己那份——纹饰登记、嵌片嵌贴、归属道次、事后补记认领；髹涂工序台（`/coats`）只记自己那份——髹涂道次、罩漆位置、罩漆道次状态。两边互不改写对方那份，只按「胎体编号 + 位置」做只读核对：
+
+- 工序台罩漆前逐位置对工位嵌贴：嵌片没嵌完，该道先**停在「待嵌」**；位置在工位对不上登记，先**挂起等补**；全部已嵌才放行。
+- 已罩过漆的位置，工位事后补记的单列为**待认领**（归属道次挂不上），**不退回**罩漆那道。
+- 任一边写入失败只重试自己那张表（`utils/retry.ts`），另一份不动。
 
 纯前端单页应用（React 18 + TypeScript + Ant Design + Vite + Zustand + React Router），**无后端、无数据库服务、无 API 服务**，全部数据保存在浏览器本地（IndexedDB / Dexie + 少量 localStorage 元数据），刷新或重启浏览器后依然存在。
 
@@ -68,10 +74,10 @@ npm run preview    # 本地预览构建产物（http://localhost:22818）
 | 路由 | 页面 | 主要职责 | 消费模型 |
 | --- | --- | --- | --- |
 | `/bodies` | 胎体与器型台账 | 新建胎体、按材质与器型筛选（同步 URL query），卡片回显已完成道次与最近荫房记录 | Body、Coat、Room |
-| `/coats` | 髹涂道次编排 | 拖拽调整道次先后并重编号、批量改漆种与状态、同器型自动带出上次漆种与间隔建议 | Coat、Body |
+| `/coats` | 髹涂道次编排 | 拖拽调整道次先后并重编号、批量改漆种与状态、同器型自动带出上次漆种与间隔建议；罩漆道次登记罩漆位置，罩漆前按位置核对工位嵌贴，没嵌完停在「待嵌」、对不上挂起等补 | Coat、Inlay（只读）、Body |
 | `/rooms` | 荫房温湿度记录 | 按区间判定适宜 / 偏干 / 偏湿，越界回写关联道次为「待复检」，支持日期区间筛选 | Room、Coat |
-| `/polish` | 打磨与推光工序 | 按道次生成目数序列（320→2000），未打磨完的道次禁止进入下一道罩漆 | Polish、Coat |
-| `/inlays` | 镶嵌纹饰登记 | 螺钿 / 蛋壳 / 描金 / 戗金登记与批量调整分类，器型示意区叠加显示 | Inlay、Body |
+| `/polish` | 打磨与推光工序 | 按道次生成目数序列（320→2000），未打磨完的道次禁止进入下一道罩漆；另列停在「待嵌」的罩漆道次 | Polish、Coat |
+| `/inlays` | 镶嵌纹饰登记（镶嵌工位） | 螺钿 / 蛋壳 / 描金 / 戗金登记、嵌片嵌贴与归属道次，器型示意区叠加显示；已罩后补记单列待认领、挂不上挂起等补，只写工位这份 | Inlay、Coat（只读）、Body |
 | `/export` | 成品质检与导出 | 质检登记（返工定位到具体道次与荫房记录）、返工清单、JSON 导入导出与清空重播种 | Inspect 及全部模型 |
 
 `/` 与未匹配路径重定向到 `/bodies`。筛选条件写入 URL query（`?kw=&paintType=&state=` 等），刷新后条件保留，可直接分享链接。
@@ -83,13 +89,16 @@ npm run preview    # 本地预览构建产物（http://localhost:22818）
 | 模型 | 文件 | 关键字段 | 说明 |
 | --- | --- | --- | --- |
 | Body 胎体 | `src/types/body.ts` | `id` `code` `material`（木/脱胎/金属） `shape`（碗/盘/盒/瓶） `sizeMm` `ownerName` `state`（待髹涂/髹涂中/待荫干/已完成） | 新建后进入道次编排，卡片回显进度与最近荫房 |
-| Coat 髹涂道次 | `src/types/coat.ts` | `id` `bodyId` `seq` `paintType`（生漆/色漆/罩漆） `colorName` `coatDate` `thicknessUm` `state`（待涂/已涂/待打磨/已完成） `needRecheck` | 拖拽调序，同器型带出上次漆种与间隔建议 |
+| Coat 髹涂道次 | `src/types/coat.ts` | `id` `bodyId` `seq` `paintType`（生漆/色漆/罩漆） `colorName` `coatDate` `thicknessUm` `state`（待涂/已涂/**待嵌**/待打磨/已完成） `coverPositions`（罩漆覆盖位置，工序台留底） `needRecheck` | 拖拽调序，同器型带出上次漆种与间隔建议；罩漆前按位置核对工位嵌贴，没嵌完停在待嵌 |
 | Room 荫房记录 | `src/types/room.ts` | `id` `bodyId` `date` `tempC` `humidityPct` `inAt` `outAt` `verdict`（适宜/偏干/偏湿） | 越界即回写关联道次为待复检 |
 | Polish 打磨推光 | `src/types/polish.ts` | `id` `bodyId` `seq` `grit` `method`（水砂/推光/揩清） `durationMin` `operator` | 按道次生成目数序列 |
-| Inlay 镶嵌 | `src/types/inlay.ts` | `id` `bodyId` `type`（螺钿/蛋壳/描金/戗金） `pattern` `position` `materialNote` | 器型示意区叠加显示，支持批量改分类 |
+| Inlay 镶嵌 | `src/types/inlay.ts` | `id` `bodyId` `type`（螺钿/蛋壳/描金/戗金） `pattern` `position` `materialNote` `affixState`（待嵌/已嵌） `affixSeq`（归属罩漆道次，挂不上为 null） `claimState`（正常/待认领） `affixedAt` | 镶嵌工位自留底；按 胎体编号+位置 与工序台核对，已罩后补记单列待认领 |
 | Inspect 质检 | `src/types/inspect.ts` | `id` `bodyId` `verdict`（合格/返工） `defectNote` `inspector` `date` `defectCoatSeq` `defectRoomId` | 返工定位到道次与荫房记录并生成返工清单 |
 
-数据结构版本号 `DB_SCHEMA_VERSION` 定义在 `src/utils/db.ts`，当前为 `v2`：`coats` 表增加 `paintType` 索引，并在 Dexie `.upgrade()` 中为历史记录回填 `paintType = 'raw'`、`needRecheck = false`、`thicknessUm = 40`。
+数据结构版本号 `DB_SCHEMA_VERSION` 定义在 `src/utils/db.ts`，当前为 `v3`：
+
+- `v1→v2`：`coats` 表增加 `paintType` 索引，并在 Dexie `.upgrade()` 中回填 `paintType='raw'`、`needRecheck=false`、`thicknessUm=40`。
+- `v2→v3`：镶嵌与罩漆两摊分开留底。`coats` 加 `coverPositions` 多值索引，`inlays` 加 `affixState` / `affixSeq` / `claimState` 索引。旧镶嵌记录只有图案和位置：一律按「嵌片已嵌贴」补 `affixState`，归属道次按同胎体覆盖该位置的第一道罩漆道次补 `affixSeq`，**挂不上的（无罩漆道次或该位置已罩过漆才补记）单列 `claimState='unclaimed'` 待认领**。导入旧版 JSON 备份走同一口径（`normalizeSnapshot()`）。核对纯逻辑在 `src/utils/inlayGate.ts`，单摊写入重试在 `src/utils/retry.ts`。
 
 ---
 
@@ -105,7 +114,7 @@ sologsb101-1018/
 │   │   ├── hooks/                # useCoatProgress.ts useIdbTable.ts
 │   │   ├── pages/                # BodyList.tsx CoatBoard.tsx RoomLog.tsx PolishBoard.tsx InlayBoard.tsx ExportView.tsx
 │   │   ├── router/               # index.tsx
-│   │   ├── utils/                # humidity.ts db.ts export.ts
+│   │   ├── utils/                # humidity.ts db.ts export.ts inlayGate.ts retry.ts
 │   │   ├── styles/               # main.css
 │   │   ├── App.tsx main.tsx
 │   ├── public/favicon.svg

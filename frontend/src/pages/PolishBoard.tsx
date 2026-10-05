@@ -74,14 +74,19 @@ export default function PolishBoard() {
     [polishTable.rows, bodyId],
   );
 
-  /** 已涂但尚未打磨的道次：未打磨完禁止进入下一道罩漆 */
+  /** 已涂但尚未打磨的道次：未打磨完禁止进入下一道罩漆；「待嵌」是罩漆前嵌贴卡位，不算打磨阻塞 */
   const blocked = useMemo(
     () =>
       bodyCoats.filter(
-        (coat) => coat.state === 'toPolish' && !rows.some((row) => row.seq === coat.seq),
+        (coat) =>
+          coat.state === 'toPolish' &&
+          !rows.some((row) => row.seq === coat.seq),
       ),
     [bodyCoats, rows],
   );
+
+  /** 停在待嵌的罩漆道次：工位嵌片没嵌完或位置挂起，先不放行打磨 */
+  const awaitingInlay = useMemo(() => bodyCoats.filter((coat) => coat.state === 'awaitInlay'), [bodyCoats]);
 
   const stat = bodyId ? progressOf(bodyId) : null;
   const totalMinutes = rows.reduce((sum, row) => sum + row.durationMin, 0);
@@ -238,8 +243,18 @@ export default function PolishBoard() {
         <StatBadge label="最高目数" value={maxGrit || '-'} suffix="目" tone="warning" />
         <StatBadge label="道次完成率" value={`${stat?.coatPercent ?? 0}%`} percent={stat?.coatPercent ?? 0} tone="success" />
         <StatBadge label="阻塞道次" value={blocked.length} suffix="道" tone="danger" />
+        <StatBadge label="待嵌罩漆" value={awaitingInlay.length} suffix="道" tone="warning" />
       </div>
 
+      {awaitingInlay.length > 0 ? (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 14 }}
+          message={`第 ${awaitingInlay.map((coat) => coat.seq).join('、')} 道罩漆停在「待嵌」`}
+          description="镶嵌工位的嵌片还没嵌完或位置对不上挂起；请到「镶嵌纹饰」页核对嵌贴，罩漆那道放行后再安排打磨。"
+        />
+      ) : null}
       {blocked.length > 0 ? (
         <Alert
           type="warning"

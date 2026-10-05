@@ -240,6 +240,19 @@ body::before {
   white-space: nowrap;
 }
 
+/* 嵌片未嵌完：虚线琥珀边，提示工序台罩漆会停在待嵌 */
+.gb-vessel__mark.is-pending {
+  border-style: dashed;
+  border-color: var(--gb-gold);
+  box-shadow: 0 0 0 2px rgba(201, 150, 60, 0.18);
+}
+
+/* 待认领 / 挂起等补：朱红描边 */
+.gb-vessel__mark.is-flagged {
+  border-color: var(--gb-red);
+  box-shadow: 0 0 0 2px rgba(140, 47, 31, 0.16);
+}
+
 .gb-vessel__legend {
   margin-top: 10px;
   display: flex;

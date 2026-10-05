@@ -34,6 +34,7 @@ import FilterBar, { useFilterQuery, type FilterSelectConfig } from '@/components
 import StatBadge from '@/components/common/StatBadge';
 import StageTag from '@/components/common/StageTag';
 import { useCoatProgress } from '@/hooks/useCoatProgress';
+import { useIdbTable } from '@/hooks/useIdbTable';
 import { useBodyStore } from '@/stores/bodyStore';
 import { useCoatStore } from '@/stores/coatStore';
 import {
@@ -49,6 +50,9 @@ import {
   type PaintType,
 } from '@/types/coat';
 import { BODY_SHAPE_LABEL } from '@/types/body';
+import { INLAY_POSITION_OPTIONS } from '@/types/inlay';
+import type { Inlay } from '@/types/inlay';
+import { evaluateInlayGate } from '@/utils/inlayGate';
 import { suggestIntervalHours } from '@/utils/humidity';
 
 const FILTER_KEYS = ['paintType', 'state'] as const;
@@ -71,9 +75,14 @@ export default function CoatBoard() {
   const removeCoat = useCoatStore((state) => state.removeCoat);
   const batchUpdate = useCoatStore((state) => state.batchUpdate);
   const advanceState = useCoatStore((state) => state.advanceState);
+  const haltAtInlay = useCoatStore((state) => state.haltAtInlay);
+  const releaseInlay = useCoatStore((state) => state.releaseInlay);
   const reorderCoats = useCoatStore((state) => state.reorderCoats);
   const nextSeq = useCoatStore((state) => state.nextSeq);
   const suggestForBody = useCoatStore((state) => state.suggestForBody);
+
+  // 工位那份只读：罩漆前按 胎体编号 + 位置 对工位嵌贴，本页不改写 inlays
+  const inlayTable = useIdbTable<Inlay>((database) => database.inlays, { sortByUpdatedAt: false });
 
   const { progressOf, currentCoatText, totals } = useCoatProgress();
   const url = useFilterQuery(FILTER_KEYS);
@@ -85,6 +94,7 @@ export default function CoatBoard() {
   const [batchState, setBatchState] = useState<CoatState>('coated');
   const [dragId, setDragId] = useState<string | null>(null);
   const [overId, setOverId] = useState<string | null>(null);
+  const watchedPaintType = Form.useWatch('paintType', form) as PaintType | undefined;
 
   const activeBody = bodies.find((body) => body.id === currentBodyId) ?? bodies[0] ?? null;
   const bodyId = activeBody?.id ?? '';
@@ -140,13 +150,18 @@ export default function CoatBoard() {
       thicknessUm: coat.thicknessUm,
       state: coat.state,
       needRecheck: coat.needRecheck,
+      coverPositions: coat.coverPositions,
     });
     setOpen(true);
   };
 
   const submit = async (): Promise<void> => {
     const values = await form.validateFields();
-    const payload: CoatDraft = { ...values };
+    const payload: CoatDraft = {
+      ...values,
+      // 非罩漆道次不登记罩漆位置，仍保留空数组留底，避免字段缺失
+      coverPositions: values.paintType === 'topcoat' ? values.coverPositions ?? [] : [],
+    };
     if (editing) {
       await updateCoat(editing.id, payload);
       message.success(`已更新第 ${payload.seq} 道工序`);
@@ -178,15 +193,58 @@ export default function CoatBoard() {
     message.success('道次顺序已更新并重编号');
   };
 
-  /** 状态推进校验：前一道未完成时禁止进入下一道 */
+  /**
+   * 罩漆前核对工位嵌贴（按 胎体编号 + 位置）：
+   * - 没登记罩漆位置 → 提示先登记位置，不动道次
+   * - 有位置工位没登记（对不上）→ 先挂起等补，道次停在待嵌
+   * - 登记了但没嵌完 → 该道停在待嵌
+   * - 全部已嵌 → 放行进入待打磨（不改工位那份）
+   */
+  const checkInlayGate = async (coat: Coat): Promise<void> => {
+    if (coat.coverPositions.length === 0) {
+      message.warning(`第 ${coat.seq} 道还没登记罩漆位置，请先在道次上补登记要罩的位置`);
+      return;
+    }
+    const gate = evaluateInlayGate(coat, inlayTable.rows);
+    if (gate.unregisteredPositions.length > 0) {
+      await haltAtInlay(coat.id);
+      message.warning(
+        `位置 ${gate.unregisteredPositions.join('、')} 在工位对不上镶嵌登记，先挂起等补；第 ${coat.seq} 道停在待嵌`,
+      );
+      return;
+    }
+    if (gate.pendingPositions.length > 0) {
+      await haltAtInlay(coat.id);
+      message.warning(`位置 ${gate.pendingPositions.join('、')} 嵌片没嵌完，第 ${coat.seq} 道先停在待嵌`);
+      return;
+    }
+    await releaseInlay(coat.id);
+    message.success(`位置 ${gate.affixedPositions.join('、')} 均已嵌贴到位，第 ${coat.seq} 道已放行罩漆`);
+  };
+
+  /** 状态推进：上一道未完成禁止进入下一道；罩漆道次（已涂/待嵌）必须先过工位嵌贴核对 */
   const handleAdvance = async (coat: Coat): Promise<void> => {
     const previous = bodyCoats.find((item) => item.seq === coat.seq - 1);
     if (previous && previous.state !== 'done') {
       message.warning(`第 ${previous.seq} 道尚未完成，禁止进入第 ${coat.seq} 道`);
       return;
     }
+    const needGate = coat.paintType === 'topcoat' && (coat.state === 'coated' || coat.state === 'awaitInlay');
+    if (needGate) {
+      await checkInlayGate(coat);
+      return;
+    }
     await advanceState(coat.id);
   };
+
+  /** 当前胎体各罩漆道次的核对结果，用于顶部提示 */
+  const topcoatGates = useMemo(
+    () =>
+      bodyCoats
+        .filter((coat) => coat.paintType === 'topcoat')
+        .map((coat) => ({ coat, gate: evaluateInlayGate(coat, inlayTable.rows) })),
+    [bodyCoats, inlayTable.rows],
+  );
 
   const columns: ColumnsType<Coat> = [
     {
@@ -219,6 +277,31 @@ export default function CoatBoard() {
       ),
     },
     { title: '漆种', dataIndex: 'paintType', width: 100, render: (value: PaintType) => <Tag>{PAINT_TYPE_LABEL[value]}</Tag> },
+    {
+      title: '罩漆位置',
+      dataIndex: 'coverPositions',
+      width: 150,
+      render: (positions: string[], record) =>
+        record.paintType === 'topcoat' ? (
+          positions.length > 0 ? (
+            <Space size={4} wrap>
+              {positions.map((position) => (
+                <Tag key={position} color="gold">
+                  {position}
+                </Tag>
+              ))}
+            </Space>
+          ) : (
+            <Typography.Text type="warning" style={{ fontSize: 12 }}>
+              未登记位置
+            </Typography.Text>
+          )
+        ) : (
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            —
+          </Typography.Text>
+        ),
+    },
     { title: '色名', dataIndex: 'colorName', width: 120 },
     { title: '涂刷日期', dataIndex: 'coatDate', width: 130, sorter: (a, b) => a.coatDate.localeCompare(b.coatDate) },
     {
@@ -233,6 +316,11 @@ export default function CoatBoard() {
       width: 220,
       render: (_value, record) => (
         <Space size={4} wrap>
+          {record.paintType === 'topcoat' && (record.state === 'coated' || record.state === 'awaitInlay') ? (
+            <Button size="small" type="link" onClick={() => void checkInlayGate(record)}>
+              核对嵌贴
+            </Button>
+          ) : null}
           <Button size="small" type="link" onClick={() => void handleAdvance(record)}>
             推进状态
           </Button>
@@ -306,6 +394,41 @@ export default function CoatBoard() {
             >
               带出建议
             </Button>
+          }
+        />
+      ) : null}
+
+      {topcoatGates.length > 0 ? (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 14 }}
+          message="罩漆前按胎体编号 + 位置核对镶嵌工位嵌贴"
+          description={
+            <Space direction="vertical" size={4}>
+              {topcoatGates.map(({ coat, gate }) =>
+                coat.state === 'done' ? (
+                  <Typography.Text key={coat.id} type="success" style={{ fontSize: 12 }}>
+                    第 {coat.seq} 道罩漆已完成（{coat.coverPositions.join('、') || '位置未登记'}）。
+                  </Typography.Text>
+                ) : coat.coverPositions.length === 0 ? (
+                  <Typography.Text key={coat.id} type="secondary" style={{ fontSize: 12 }}>
+                    第 {coat.seq} 道罩漆未登记罩漆位置，核对前请先补登记。
+                  </Typography.Text>
+                ) : gate.canTopcoat ? (
+                  <Typography.Text key={coat.id} type="success" style={{ fontSize: 12 }}>
+                    第 {coat.seq} 道：位置 {gate.affixedPositions.join('、')} 均已嵌贴，可罩漆。
+                  </Typography.Text>
+                ) : (
+                  <Typography.Text key={coat.id} type="warning" style={{ fontSize: 12 }}>
+                    第 {coat.seq} 道停在待嵌：
+                    {gate.unregisteredPositions.length > 0 ? ` 对不上(${gate.unregisteredPositions.join('、')})挂起等补；` : ''}
+                    {gate.pendingPositions.length > 0 ? ` 没嵌完(${gate.pendingPositions.join('、')})；` : ''}
+                    当前状态：{COAT_STATE_LABEL[coat.state]}。
+                  </Typography.Text>
+                ),
+              )}
+            </Space>
           }
         />
       ) : null}
@@ -451,6 +574,20 @@ export default function CoatBoard() {
               ]}
             />
           </Form.Item>
+          {watchedPaintType === 'topcoat' ? (
+            <Form.Item
+              name="coverPositions"
+              label="罩漆位置（工序台留底）"
+              extra="罩漆前按 胎体编号 + 位置 对工位嵌贴；没嵌完这道停在待嵌，对不上先挂起等补。"
+            >
+              <Select
+                mode="multiple"
+                allowClear
+                placeholder="选择本道罩漆覆盖的位置"
+                options={INLAY_POSITION_OPTIONS.map((item) => ({ value: item, label: item }))}
+              />
+            </Form.Item>
+          ) : null}
           <Alert
             type="warning"
             showIcon

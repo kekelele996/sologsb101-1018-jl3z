@@ -7,6 +7,7 @@ import { db, createId } from '@/utils/db';
 import type { Coat, CoatDraft, CoatState, PaintType } from '@/types/coat';
 import { nextCoatState } from '@/types/coat';
 import { suggestIntervalHours, suggestPaintType } from '@/utils/humidity';
+import { retryOwnWrite } from '@/utils/retry';
 import { useBodyStore } from './bodyStore';
 
 export interface PaintSuggestion {
@@ -28,6 +29,10 @@ interface CoatStoreState {
   removeCoat: (id: string) => Promise<void>;
   batchUpdate: (ids: string[], patch: Partial<Coat>) => Promise<void>;
   advanceState: (id: string) => Promise<void>;
+  /** 罩漆前核对工位嵌贴：位置没嵌完，把该道停在「待嵌」（只写工序台这份） */
+  haltAtInlay: (id: string) => Promise<void>;
+  /** 核对通过：从「待嵌」解除，进入待打磨（只写工序台这份，不退回/不改工位记录） */
+  releaseInlay: (id: string) => Promise<void>;
   markRecheck: (bodyId: string, recheck: boolean) => Promise<void>;
   reorderCoats: (bodyId: string, orderedIds: string[]) => Promise<void>;
   nextSeq: (bodyId: string) => number;
@@ -61,27 +66,30 @@ export const useCoatStore = create<CoatStoreState>((set, get) => ({
   async createCoat(draft) {
     const now = Date.now();
     const row: Coat = { ...draft, id: createId('coat'), createdAt: now, updatedAt: now };
-    await db.coats.put(row);
+    // 工序台这份单独写、单独重试，不动工位 inlays
+    await retryOwnWrite(() => db.coats.put(row), '工序台道次留底');
     await get().loadCoats();
     return row;
   },
 
   async updateCoat(id, patch) {
-    await db.coats.update(id, { ...patch, updatedAt: Date.now() } as never);
+    await retryOwnWrite(() => db.coats.update(id, { ...patch, updatedAt: Date.now() } as never), '工序台道次留底');
     await get().loadCoats();
   },
 
   async removeCoat(id) {
     const target = get().coats.find((coat) => coat.id === id);
-    await db.coats.delete(id);
-    if (target) {
-      // 删除后按序重编号，保持 seq 连续
-      const rest = get()
-        .coats.filter((coat) => coat.bodyId === target.bodyId && coat.id !== id)
-        .sort((a, b) => a.seq - b.seq)
-        .map((coat, index) => ({ ...coat, seq: index + 1, updatedAt: Date.now() }));
-      if (rest.length > 0) await db.coats.bulkPut(rest);
-    }
+    await retryOwnWrite(async () => {
+      await db.coats.delete(id);
+      if (target) {
+        // 删除后按序重编号，保持 seq 连续（仍只写工序台这张表）
+        const rest = get()
+          .coats.filter((coat) => coat.bodyId === target.bodyId && coat.id !== id)
+          .sort((a, b) => a.seq - b.seq)
+          .map((coat, index) => ({ ...coat, seq: index + 1, updatedAt: Date.now() }));
+        if (rest.length > 0) await db.coats.bulkPut(rest);
+      }
+    }, '工序台道次留底');
     await get().loadCoats();
   },
 
@@ -91,7 +99,7 @@ export const useCoatStore = create<CoatStoreState>((set, get) => ({
     const rows = get()
       .coats.filter((coat) => ids.includes(coat.id))
       .map((coat) => ({ ...coat, ...patch, updatedAt: now }));
-    await db.coats.bulkPut(rows);
+    await retryOwnWrite(() => db.coats.bulkPut(rows), '工序台道次留底');
     await get().loadCoats();
   },
 
@@ -103,11 +111,34 @@ export const useCoatStore = create<CoatStoreState>((set, get) => ({
     await get().updateCoat(id, { state: next });
   },
 
+  async haltAtInlay(id) {
+    const coat = get().coats.find((item) => item.id === id);
+    if (!coat || coat.state === 'awaitInlay') return;
+    // 只写工序台自己这份；失败仅重试本份，工位 inlays 那份不动
+    await retryOwnWrite(async () => {
+      await db.coats.update(id, { state: 'awaitInlay' as CoatState, updatedAt: Date.now() });
+    }, '工序台罩漆道次');
+    await get().loadCoats();
+  },
+
+  async releaseInlay(id) {
+    const coat = get().coats.find((item) => item.id === id);
+    // 第一次核对就通过时道次可能仍在「已涂」（没停过待嵌），同样放行到待打磨
+    if (!coat || (coat.state !== 'awaitInlay' && coat.state !== 'coated')) return;
+    await retryOwnWrite(async () => {
+      await db.coats.update(id, { state: 'toPolish' as CoatState, updatedAt: Date.now() });
+    }, '工序台罩漆道次');
+    await get().loadCoats();
+  },
+
   async markRecheck(bodyId, recheck) {
     const affected = get().coats.filter((coat) => coat.bodyId === bodyId && coat.state !== 'done');
     if (affected.length === 0) return;
     const now = Date.now();
-    await db.coats.bulkPut(affected.map((coat) => ({ ...coat, needRecheck: recheck, updatedAt: now })));
+    await retryOwnWrite(
+      () => db.coats.bulkPut(affected.map((coat) => ({ ...coat, needRecheck: recheck, updatedAt: now }))),
+      '工序台道次留底',
+    );
     await get().loadCoats();
   },
 
@@ -121,7 +152,7 @@ export const useCoatStore = create<CoatStoreState>((set, get) => ({
         return ai - bi;
       })
       .map((coat, index) => ({ ...coat, seq: index + 1, updatedAt: Date.now() }));
-    await db.coats.bulkPut(rows);
+    await retryOwnWrite(() => db.coats.bulkPut(rows), '工序台道次留底');
     await get().loadCoats();
   },
 
